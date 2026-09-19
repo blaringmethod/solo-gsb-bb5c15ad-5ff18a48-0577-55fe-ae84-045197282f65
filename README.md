@@ -8,7 +8,8 @@
 - 审计记录持久化于 SQLite，可按 ID 查询；
 - 支持基于已有审计**即时生成序列修复预演**（不落库）：首个 serial 不变，其后各项与上一个修复后值按 RFC 1982 比较，非有效前进即替换为上一修复后值加 1（32 位无符号回绕）；
 - 提供 **SOA 序列号持久化预留**：在 SQLite 写事务内按区域原子分配下一个 YYYYMMDDnn serial，并发请求不会获得重复值；以 `request_id` 为幂等键，重试安全返回首次结果；预留记录持久化，可按区域查询；
-- 提供 **多权威节点共同发布规划**（`POST /api/zones/{zone}/release-plans`，仅规划不写库）：提交各权威节点的名称与当前 serial，在当日 `YYYYMMDD00`～`99` 候选区间内从小到大找出首个相对**每个节点**都是 RFC 1982 有效前进的候选值；当日区间不存在共同候选时返回 **409**，并给出各节点的 `equal`/`regression`/`incomparable` 阻断摘要。
+- 提供 **多权威节点共同发布规划**（`POST /api/zones/{zone}/release-plans`，仅规划不写库）：提交各权威节点的名称与当前 serial，在当日 `YYYYMMDD00`～`99` 候选区间内从小到大找出首个相对**每个节点**都是 RFC 1982 有效前进的候选值；当日区间不存在共同候选时返回 **409**，并给出各节点的 `equal`/`regression`/`incomparable` 阻断摘要；
+- 提供 **区域传送收敛预演**（`POST /api/zones/{zone}/transfer-simulations`，结果不落库）：提交节点当前 serial、有向传送边与源节点发布值，第 0 轮源节点切换到发布值，此后按同步轮次推演——每个节点从上一轮上游中选择相对自身为 RFC 1982 有效前进且前向距离最小的 serial（距离并列按上游名排序），所有节点同时更新，直至稳定或达到 `max_rounds`；返回逐轮变更、最终快照与未收敛节点，达到上限后仍可更新时返回 **409** 并携带当前快照。
 
 ## 快速启动（单条命令）
 
@@ -17,6 +18,8 @@ docker compose up --build
 ```
 
 启动后在浏览器访问 **http://localhost:8000**（根路径返回服务信息；交互式 API 文档见 **http://localhost:8000/docs**，健康检查 http://localhost:8000/health）。
+
+**端口说明**：服务在容器内监听 **8000** 端口，`docker-compose.yml` 默认将宿主机 `8000` 映射到容器 `8000`（`"8000:8000"`）；如需更换宿主机端口，修改该映射的左侧即可（如 `"8080:8000"` 后访问 http://localhost:8080）。
 
 依赖安装与 SQLite 建表均在启动时自动完成，无需额外初始化步骤；数据通过命名卷 `dns-audit-data` 持久化。
 
@@ -39,6 +42,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/zones/{zone}/serial-reservations` | 原子预留下一个 serial 并持久化（201；幂等重试返回 200；冲突返回 409） |
 | `GET` | `/api/zones/{zone}/serial-reservations` | 按区域查询预留记录（预留先后升序，支持 `limit`/`offset`） |
 | `POST` | `/api/zones/{zone}/release-plans` | 多权威节点共同发布规划，不写库（200；当日无共同候选返回 409） |
+| `POST` | `/api/zones/{zone}/transfer-simulations` | 区域传送收敛预演，不落库（200；达到轮次上限仍未收敛返回 409） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交审计
@@ -242,6 +246,98 @@ curl -s -X POST http://localhost:8000/api/zones/example.com/release-plans \
 - 上例中 `ns1` 只接受 `00..69`（在 `70` 处与候选相距恰好 `2^31` 不可比较），而 `ns2` 已持有 `9970`（仅 `71..99` 才是前进、`70` 相等），两节点可行区间互不相交，因此需等待下一日期或先协调各节点 serial；
 - 指定的 `today` 超出 32 位序列号可表达范围（如 `9999-12-31`）时返回 **409**，`detail.reason` 为 `date_out_of_range`；节点名重复/空白、`serial` 越界等请求体问题返回 **422**，路径中区域名非法返回 **400**。
 
+### 区域传送收敛预演
+
+`POST /api/zones/{zone}/transfer-simulations` 用于发布前推演一次 serial 在传送拓扑中的收敛过程，**结果不写入数据库**（不会产生审计或预留记录）。请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `nodes` | 节点列表（至少 1 个、至多 256 个）；每项含 `name`（节点名，去除首尾空白后须在请求内唯一）与 `serial`（当前 SOA serial，`0..4294967295`） |
+| `edges` | 有向传送边列表（至多 4096 条，可为空）；每项含 `upstream` 与 `downstream`，表示 serial 从上游节点传向下游节点，端点须为已声明节点 |
+| `source` | 发布源节点名（须为已声明节点） |
+| `publish_serial` | 源节点在第 0 轮切换到的发布 serial，须相对源节点当前值为 RFC 1982 有效前进，否则返回 **422** |
+| `max_rounds` | 可选，同步更新轮次上限（`1..4096`，缺省 `64`），不含第 0 轮源节点切换 |
+
+推演规则：**第 0 轮**源节点切换到 `publish_serial`；此后每轮各节点从**上一轮**各上游持有的 serial 中，选出相对自身当前值为有效前进（advance）且**前向距离最小**者（距离并列按上游节点名升序），所有节点**同时**更新；没有有效前进上游的节点保持原值。如此往复，直至某轮不再有任何变更（收敛）或达到 `max_rounds`。环路中的节点（含源节点自身）沿用同一规则。
+
+```bash
+curl -s -X POST http://localhost:8000/api/zones/example.com/transfer-simulations \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "nodes": [
+          {"name": "ns1.example.com", "serial": 2026091805},
+          {"name": "ns2.example.com", "serial": 2026091805},
+          {"name": "ns3.example.com", "serial": 2026091800}
+        ],
+        "edges": [
+          {"upstream": "ns1.example.com", "downstream": "ns2.example.com"},
+          {"upstream": "ns2.example.com", "downstream": "ns3.example.com"},
+          {"upstream": "ns1.example.com", "downstream": "ns3.example.com"}
+        ],
+        "source": "ns1.example.com",
+        "publish_serial": 2026091900,
+        "max_rounds": 16
+      }'
+```
+
+```json
+{
+  "zone": "example.com",
+  "source": "ns1.example.com",
+  "publish_serial": 2026091900,
+  "max_rounds": 16,
+  "converged": true,
+  "rounds": [
+    {"round": 0, "changes": [
+      {"node": "ns1.example.com", "from_serial": 2026091805, "to_serial": 2026091900, "upstream": null, "forward_distance": 95}
+    ]},
+    {"round": 1, "changes": [
+      {"node": "ns2.example.com", "from_serial": 2026091805, "to_serial": 2026091900, "upstream": "ns1.example.com", "forward_distance": 95},
+      {"node": "ns3.example.com", "from_serial": 2026091800, "to_serial": 2026091805, "upstream": "ns2.example.com", "forward_distance": 5}
+    ]},
+    {"round": 2, "changes": [
+      {"node": "ns3.example.com", "from_serial": 2026091805, "to_serial": 2026091900, "upstream": "ns1.example.com", "forward_distance": 95}
+    ]}
+  ],
+  "snapshot": [
+    {"name": "ns1.example.com", "serial": 2026091900},
+    {"name": "ns2.example.com", "serial": 2026091900},
+    {"name": "ns3.example.com", "serial": 2026091900}
+  ],
+  "unconverged": [],
+  "note": "传送收敛预演仅用于发布前推演，不写入数据库"
+}
+```
+
+- `rounds[]` 仅记录**有变更**的轮次；第 0 轮恒为源节点切换（`upstream` 为 `null`）。上例第 1 轮中 `ns3` 选择了距离更近的 `ns2`（距离 5）而非 `ns1`（距离 100），第 2 轮再以新值为基准前进到发布值——每轮都基于上一轮快照同步计算；
+- `snapshot` 为最终快照（与请求 `nodes` 顺序一致），`unconverged` 为预演结束时仍可更新的节点（收敛时为空）；
+- 达到 `max_rounds` 后仍有节点可更新时返回 **409**，`detail` 携带截至上限的逐轮变更、当前快照与未收敛节点：
+
+```json
+{
+  "detail": {
+    "reason": "not_converged",
+    "message": "达到同步轮次上限 2 后仍有 1 个节点可更新，区域传送未收敛",
+    "max_rounds": 2,
+    "rounds": [
+      {"round": 0, "changes": [{"node": "ns1", "from_serial": 100, "to_serial": 105, "upstream": null, "forward_distance": 5}]},
+      {"round": 1, "changes": [{"node": "ns2", "from_serial": 100, "to_serial": 105, "upstream": "ns1", "forward_distance": 5}]},
+      {"round": 2, "changes": [{"node": "ns3", "from_serial": 100, "to_serial": 105, "upstream": "ns2", "forward_distance": 5}]}
+    ],
+    "snapshot": [
+      {"name": "ns1", "serial": 105},
+      {"name": "ns2", "serial": 105},
+      {"name": "ns3", "serial": 105},
+      {"name": "ns4", "serial": 100}
+    ],
+    "unconverged": ["ns4"]
+  }
+}
+```
+
+- 节点只会切换到上游已持有的值，每次切换都是严格前进，因此轮次足够时必然收敛；收到 409 时可调大 `max_rounds` 重试；
+- 节点名重复/空白、源节点或边端点引用未声明节点、发布值对源节点非有效前进（相等/倒退/不可比较）、`serial` 或 `max_rounds` 越界等返回 **422**；路径中区域名非法返回 **400**。
+
 ## 判定规则（RFC 1982）
 
 serial 是模 `2^32` 环形空间上的值。设前向距离 `d = (current - previous) mod 2^32`：
@@ -277,6 +373,7 @@ app/
   suggest.py   # YYYYMMDDnn 下一序列号建议
   repair.py    # 序列修复预演（不落库）
   release_plan.py  # 多权威节点共同发布规划（不落库）
+  transfer_sim.py  # 区域传送收敛预演（不落库）
   service.py   # 逐项判定与汇总
   db.py        # SQLite 持久层（审计记录 + serial 预留的事务化分配与查询）
   schemas.py   # 请求/响应模型与校验

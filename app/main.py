@@ -19,12 +19,16 @@ from .schemas import (
     RepairPlanOut,
     SerialReservationCreate,
     SerialReservationOut,
+    TransferSimulationConflictResponse,
+    TransferSimulationCreate,
+    TransferSimulationOut,
     validate_zone,
 )
 from .repair import build_repair_plan
 from .release_plan import ReleasePlanError, build_release_plan
 from .service import analyze
 from .suggest import SuggestionError, suggest_next_serial
+from .transfer_sim import TransferSimulationError, simulate_transfer
 
 
 def _normalize_zone(zone: str) -> str:
@@ -237,6 +241,56 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     ),
                     "checked": exc.checked,
                     "blockers": exc.blockers,
+                },
+            ) from exc
+
+    @app.post(
+        "/api/zones/{zone}/transfer-simulations",
+        response_model=TransferSimulationOut,
+        responses={
+            409: {
+                "model": TransferSimulationConflictResponse,
+                "description": (
+                    "达到 max_rounds 后仍有节点可更新（not_converged），"
+                    "detail 携带逐轮变更与当前快照"
+                ),
+            },
+            422: {"description": "节点/边引用非法，或发布值对源节点非有效前进"},
+        },
+    )
+    def create_transfer_simulation(zone: str, payload: TransferSimulationCreate) -> dict:
+        """区域传送收敛预演（仅预演，不写库）。
+
+        第 0 轮源节点切换到 ``publish_serial``；此后每轮各节点从**上一轮**
+        上游的 serial 中选择相对自身为 RFC 1982 有效前进且前向距离最小者
+        （距离并列按上游名升序），所有节点同时更新，直至稳定或达到
+        ``max_rounds``。环路中的节点（含源节点）沿用同一规则。
+
+        达到上限后仍有节点可更新时返回 409，``detail`` 携带逐轮变更、
+        当前快照与未收敛节点。
+        """
+        zone_name = _normalize_zone(zone)
+        nodes = [(node.name, node.serial) for node in payload.nodes]
+        edges = [(edge.upstream, edge.downstream) for edge in payload.edges]
+        try:
+            return simulate_transfer(
+                zone_name,
+                nodes,
+                edges,
+                payload.source,
+                payload.publish_serial,
+                payload.max_rounds,
+            )
+        except TransferSimulationError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": exc.code,
+                    "message": str(exc),
+                    "max_rounds": exc.max_rounds,
+                    "rounds": exc.rounds,
+                    "snapshot": exc.snapshot,
+                    "unconverged": exc.unconverged,
                 },
             ) from exc
 
