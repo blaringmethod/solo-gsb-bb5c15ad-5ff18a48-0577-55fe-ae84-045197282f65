@@ -19,12 +19,16 @@ from .schemas import (
     RepairPlanOut,
     SerialReservationCreate,
     SerialReservationOut,
+    TransferSimulationConflictResponse,
+    TransferSimulationCreate,
+    TransferSimulationOut,
     validate_zone,
 )
 from .repair import build_repair_plan
 from .release_plan import ReleasePlanError, build_release_plan
 from .service import analyze
 from .suggest import SuggestionError, suggest_next_serial
+from .transfer import TransferSimulationError, run_transfer_simulation
 
 
 def _normalize_zone(zone: str) -> str:
@@ -239,6 +243,52 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "blockers": exc.blockers,
                 },
             ) from exc
+
+    @app.post(
+        "/api/zones/{zone}/transfer-simulations",
+        response_model=TransferSimulationOut,
+        responses={
+            409: {
+                "model": TransferSimulationConflictResponse,
+                "description": (
+                    "执行满 max_rounds 个同步轮次后仍有节点可继续更新"
+                    "（max_rounds_exceeded，detail 携带逐轮记录、当前快照与未收敛节点）"
+                ),
+            }
+        },
+    )
+    def create_transfer_simulation(zone: str, payload: TransferSimulationCreate) -> dict:
+        """区域传送（AXFR/IXFR 传播）收敛预演，结果不写库。
+
+        第 0 轮源节点切换到 ``publish_serial``（相对其当前 serial 必须是
+        RFC 1982 有效前进，否则请求阶段即 422）；此后每个同步轮次中，每个
+        节点只依据**上一轮**快照，从有向边（``from`` 为上游）指向自己的
+        上游里选择相对自身 serial 为有效前进且前向距离最小的值，距离并列
+        按上游名字典序排序，所有节点同时更新；某轮无任何更新即收敛。
+        达到 ``max_rounds`` 后若仍有节点可更新，返回 409 并携带当前快照。
+        """
+        zone_name = _normalize_zone(zone)
+        nodes = [(node.name, node.serial) for node in payload.nodes]
+        edges = [(edge.from_, edge.to) for edge in payload.edges]
+        try:
+            result = run_transfer_simulation(
+                zone_name,
+                nodes,
+                edges,
+                payload.source,
+                payload.publish_serial,
+                payload.max_rounds,
+            )
+        except TransferSimulationError as exc:
+            detail = dict(exc.result)
+            detail["reason"] = exc.code
+            detail["message"] = str(exc)
+            raise HTTPException(status_code=409, detail=detail) from exc
+        result["note"] = (
+            "预演结果仅用于传送收敛分析，不写入数据库；第 0 轮为源节点发布切换，"
+            "其后各轮所有节点仅依据上一轮快照同时更新"
+        )
+        return result
 
     return app
 

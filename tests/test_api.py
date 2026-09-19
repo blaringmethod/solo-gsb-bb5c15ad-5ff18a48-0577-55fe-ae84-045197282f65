@@ -709,6 +709,356 @@ def test_release_plan_invalid_zone_400(client):
     assert resp.status_code == 400
 
 
+# ---------- 区域传送收敛预演 ----------
+
+
+def _simulation_payload(**overrides):
+    payload = {
+        "nodes": [
+            {"name": "s", "serial": 100},
+            {"name": "a", "serial": 90},
+            {"name": "b", "serial": 80},
+        ],
+        "edges": [{"from": "s", "to": "a"}, {"from": "a", "to": "b"}],
+        "source": "s",
+        "publish_serial": 110,
+        "max_rounds": 10,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_transfer_simulation_linear_convergence(client):
+    resp = client.post(
+        "/api/zones/example.com/transfer-simulations", json=_simulation_payload()
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["zone"] == "example.com"
+    assert body["source"] == "s"
+    assert body["publish_serial"] == 110
+    assert body["max_rounds"] == 10
+    assert body["converged"] is True
+    assert body["sync_rounds_run"] == 2
+    # 第 0 轮：仅源节点切换
+    round0 = body["rounds"][0]
+    assert round0["round"] == 0
+    assert round0["changes"] == [
+        {"node": "s", "previous_serial": 100, "serial": 110,
+         "upstream": None, "forward_distance": 10}
+    ]
+    # 第 1 轮：a 直接拿到发布值；b 只从 a 的旧值(90)前进
+    assert [(c["node"], c["previous_serial"], c["serial"], c["upstream"], c["forward_distance"])
+            for c in body["rounds"][1]["changes"]] == [
+        ("a", 90, 110, "s", 20),
+        ("b", 80, 90, "a", 10),
+    ]
+    # 第 2 轮：b 从 a 的新值前进到发布值
+    assert [(c["node"], c["serial"], c["upstream"])
+            for c in body["rounds"][2]["changes"]] == [("b", 110, "a")]
+    assert [(n["name"], n["serial"]) for n in body["snapshot"]] == [
+        ("s", 110), ("a", 110), ("b", 110)
+    ]
+    assert body["unconverged"] == []
+
+
+def test_transfer_simulation_round0_publish_equal_is_422(client):
+    # 发布值与源节点当前值相等（非前进）→ 422
+    resp = client.post(
+        "/api/zones/example.com/transfer-simulations",
+        json=_simulation_payload(publish_serial=100),
+    )
+    assert resp.status_code == 422
+
+
+def test_transfer_simulation_publish_regression_is_422(client):
+    # 发布值相对源节点倒退 → 422
+    resp = client.post(
+        "/api/zones/example.com/transfer-simulations",
+        json=_simulation_payload(publish_serial=99),
+    )
+    assert resp.status_code == 422
+
+
+def test_transfer_simulation_publish_incomparable_is_422(client):
+    # 发布值与源节点相距恰好 2^31（不可比较）→ 422
+    resp = client.post(
+        "/api/zones/example.com/transfer-simulations",
+        json=_simulation_payload(
+            nodes=[{"name": "s", "serial": 0}], edges=[],
+            publish_serial=SERIAL_HALF,
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_transfer_simulation_min_forward_distance(client):
+    # b 有两个上游：near=105（距离 5）与 far=120（距离 20），只取最近的 near
+    payload = _simulation_payload(
+        nodes=[
+            {"name": "s", "serial": 100},
+            {"name": "b", "serial": 100},
+            {"name": "near", "serial": 105},
+            {"name": "far", "serial": 120},
+        ],
+        edges=[{"from": "near", "to": "b"}, {"from": "far", "to": "b"}],
+    )
+    body = client.post(
+        "/api/zones/example.com/transfer-simulations", json=payload
+    ).json()
+    b_change = [c for c in body["rounds"][1]["changes"] if c["node"] == "b"][0]
+    assert b_change["upstream"] == "near"
+    assert b_change["serial"] == 105
+    assert b_change["forward_distance"] == 5
+
+
+def test_transfer_simulation_distance_tie_by_upstream_name(client):
+    # 上游 a 与 z 持相同 serial（距离相同）→ 按上游名取 a
+    payload = _simulation_payload(
+        nodes=[
+            {"name": "s", "serial": 100},
+            {"name": "a", "serial": 100},
+            {"name": "z", "serial": 100},
+            {"name": "b", "serial": 90},
+        ],
+        edges=[
+            {"from": "s", "to": "a"},
+            {"from": "s", "to": "z"},
+            {"from": "a", "to": "b"},
+            {"from": "z", "to": "b"},
+        ],
+        publish_serial=105,
+    )
+    body = client.post(
+        "/api/zones/example.com/transfer-simulations", json=payload
+    ).json()
+    b_change = [c for c in body["rounds"][1]["changes"] if c["node"] == "b"][0]
+    assert b_change["upstream"] == "a"
+    assert b_change["serial"] == 100
+    assert b_change["forward_distance"] == 10
+
+
+def test_transfer_simulation_non_advance_upstreams_skipped(client):
+    # 上游持有的值对 a 是倒退（距离 > 2^31）时不可选取，a 保持旧值且永不到达发布值
+    payload = _simulation_payload(
+        nodes=[
+            {"name": "s", "serial": MAX_SERIAL - 1},
+            {"name": "a", "serial": 10},
+        ],
+        edges=[{"from": "s", "to": "a"}],
+        publish_serial=MAX_SERIAL,
+    )
+    body = client.post(
+        "/api/zones/example.com/transfer-simulations", json=payload
+    ).json()
+    assert body["converged"] is True
+    assert body["sync_rounds_run"] == 0
+    assert body["snapshot"] == [
+        {"name": "s", "serial": MAX_SERIAL},
+        {"name": "a", "serial": 10},
+    ]
+    # 已稳定（无节点可更新），但 a 的 serial 不等于发布值 → 未收敛节点
+    assert body["unconverged"] == [{"name": "a", "serial": 10}]
+
+
+def test_transfer_simulation_simultaneous_update_uses_previous_round(client):
+    # a、b 都只以源 s 为上游，二者在同一轮依据第 0 轮快照同时更新
+    payload = _simulation_payload(
+        nodes=[
+            {"name": "s", "serial": 100},
+            {"name": "a", "serial": 90},
+            {"name": "b", "serial": 80},
+        ],
+        edges=[{"from": "s", "to": "a"}, {"from": "s", "to": "b"}],
+        publish_serial=110,
+    )
+    body = client.post(
+        "/api/zones/example.com/transfer-simulations", json=payload
+    ).json()
+    assert body["converged"] is True
+    assert body["sync_rounds_run"] == 1
+    assert [(c["node"], c["serial"]) for c in body["rounds"][1]["changes"]] == [
+        ("a", 110), ("b", 110)
+    ]
+
+
+def test_transfer_simulation_cycle_converges_same_rule(client):
+    # 环路 s->a->b->a：沿同一规则传播后稳定，不会无限循环
+    payload = _simulation_payload(
+        nodes=[
+            {"name": "s", "serial": 100},
+            {"name": "a", "serial": 100},
+            {"name": "b", "serial": 100},
+        ],
+        edges=[
+            {"from": "s", "to": "a"},
+            {"from": "a", "to": "b"},
+            {"from": "b", "to": "a"},
+        ],
+        publish_serial=110,
+    )
+    body = client.post(
+        "/api/zones/example.com/transfer-simulations", json=payload
+    ).json()
+    assert body["converged"] is True
+    assert [(n["name"], n["serial"]) for n in body["snapshot"]] == [
+        ("s", 110), ("a", 110), ("b", 110)
+    ]
+    assert body["unconverged"] == []
+
+
+def test_transfer_simulation_self_loop_is_ignored_for_stable_node(client):
+    # 自环不能让节点前进：s 发布后 a 无有效上游，保持不变
+    payload = _simulation_payload(
+        nodes=[{"name": "s", "serial": 100}, {"name": "a", "serial": 90}],
+        edges=[{"from": "a", "to": "a"}],
+        publish_serial=110,
+    )
+    body = client.post(
+        "/api/zones/example.com/transfer-simulations", json=payload
+    ).json()
+    assert body["converged"] is True
+    assert body["sync_rounds_run"] == 0
+    assert [n["serial"] for n in body["snapshot"]] == [110, 90]
+    assert [n["name"] for n in body["unconverged"]] == ["a"]
+
+
+def test_transfer_simulation_wraparound_advance(client):
+    # 源从 2^32-1 发布到 0：相对源为回绕前进（距离 1）；
+    # 下游 a 持 2^32-2，0 相对它也是回绕前进（距离 2），可直接同步
+    payload = _simulation_payload(
+        nodes=[
+            {"name": "s", "serial": MAX_SERIAL},
+            {"name": "a", "serial": MAX_SERIAL - 1},
+        ],
+        edges=[{"from": "s", "to": "a"}],
+        publish_serial=0,
+    )
+    body = client.post(
+        "/api/zones/example.com/transfer-simulations", json=payload
+    ).json()
+    assert body["converged"] is True
+    assert body["rounds"][0]["changes"][0]["forward_distance"] == 1
+    round1 = body["rounds"][1]["changes"][0]
+    assert round1["node"] == "a"
+    assert round1["serial"] == 0
+    assert round1["forward_distance"] == 2
+    assert [(n["name"], n["serial"]) for n in body["snapshot"]] == [
+        ("s", 0), ("a", 0)
+    ]
+    assert body["unconverged"] == []
+
+
+def test_transfer_simulation_409_when_updatable_after_limit(client):
+    # 链长 2、max_rounds=1：第 1 轮后 b 仍可更新 → 409 携带当前快照
+    resp = client.post(
+        "/api/zones/example.com/transfer-simulations",
+        json=_simulation_payload(max_rounds=1),
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "max_rounds_exceeded"
+    assert detail["converged"] is False
+    assert detail["sync_rounds_run"] == 1
+    assert detail["updatable_nodes"] == ["b"]
+    assert [(n["name"], n["serial"]) for n in detail["snapshot"]] == [
+        ("s", 110), ("a", 110), ("b", 90)
+    ]
+    assert [n["name"] for n in detail["unconverged"]] == ["b"]
+    # 409 同样携带逐轮记录（第 0 轮 + 1 个同步轮）
+    assert [r["round"] for r in detail["rounds"]] == [0, 1]
+
+
+def test_transfer_simulation_converges_exactly_at_limit_is_200(client):
+    # 最后一个被允许的同步轮恰好完成收敛（下一轮探测无更新）→ 200
+    resp = client.post(
+        "/api/zones/example.com/transfer-simulations",
+        json=_simulation_payload(max_rounds=2),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["converged"] is True
+    assert body["sync_rounds_run"] == 2
+
+
+def test_transfer_simulation_default_max_rounds(client):
+    body = client.post(
+        "/api/zones/example.com/transfer-simulations",
+        json={
+            "nodes": [{"name": "s", "serial": 100}],
+            "edges": [],
+            "source": "s",
+            "publish_serial": 101,
+        },
+    ).json()
+    assert body["max_rounds"] == 64
+
+
+def test_transfer_simulation_not_persisted(client):
+    resp = client.post(
+        "/api/zones/example.com/transfer-simulations", json=_simulation_payload()
+    )
+    assert resp.status_code == 200
+    assert client.get("/api/audits").json() == []
+    assert client.get("/api/zones/example.com/serial-reservations").json() == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _simulation_payload(
+            edges=[{"from": "ghost", "to": "s"}]),                      # 边引用未声明节点
+        _simulation_payload(
+            edges=[{"from": "s", "to": "ghost"}]),                      # 边引用未声明节点
+        _simulation_payload(source="ghost"),                            # 源节点未声明
+        _simulation_payload(
+            nodes=[{"name": "s", "serial": 100},
+                   {"name": "s", "serial": 90}]),                       # 节点名重复
+        _simulation_payload(
+            nodes=[{"name": "  ", "serial": 100}]),                     # 空白节点名
+        _simulation_payload(
+            nodes=[{"name": "s", "serial": -1}]),                       # serial 下越界
+        _simulation_payload(
+            nodes=[{"name": "s", "serial": MAX_SERIAL + 1}]),           # serial 上越界
+        _simulation_payload(source="  "),                               # 空白源节点名
+        _simulation_payload(publish_serial=-1),                         # 发布值越界
+        _simulation_payload(max_rounds=0),                              # max_rounds 下界
+        _simulation_payload(max_rounds=1001),                           # max_rounds 上界
+        {"nodes": [], "edges": [], "source": "s",
+         "publish_serial": 1},                                          # 空节点列表
+        {"edges": [], "source": "s", "publish_serial": 1},              # 缺 nodes
+        "not-an-object",                                                # 请求体非对象
+    ],
+)
+def test_transfer_simulation_invalid_body_422(client, payload):
+    resp = client.post(
+        "/api/zones/example.com/transfer-simulations", json=payload
+    )
+    assert resp.status_code == 422
+
+
+def test_transfer_simulation_invalid_zone_400(client):
+    resp = client.post(
+        "/api/zones/bad_zone!/transfer-simulations", json=_simulation_payload()
+    )
+    assert resp.status_code == 400
+
+
+def test_transfer_simulation_duplicate_edges_treated_as_one(client):
+    # 重复传送边不影响结果
+    payload = _simulation_payload(
+        edges=[{"from": "s", "to": "a"}, {"from": "s", "to": "a"}],
+        nodes=[{"name": "s", "serial": 100}, {"name": "a", "serial": 90}],
+    )
+    body = client.post(
+        "/api/zones/example.com/transfer-simulations", json=payload
+    ).json()
+    assert body["converged"] is True
+    assert [(n["name"], n["serial"]) for n in body["snapshot"]] == [
+        ("s", 110), ("a", 110)
+    ]
+
+
 # ---------- 并发：串行化分配，不重复 serial ----------
 
 

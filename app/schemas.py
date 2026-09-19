@@ -5,9 +5,9 @@ import re
 from datetime import date
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .rfc1982 import MAX_SERIAL
+from .rfc1982 import MAX_SERIAL, classify
 
 Serial = Annotated[int, Field(ge=0, le=MAX_SERIAL, description="32 位无符号序列号")]
 
@@ -247,3 +247,179 @@ class ReleasePlanConflictResponse(BaseModel):
     """无共同候选时 409 响应体（HTTPException 的标准 detail 包装）。"""
 
     detail: ReleasePlanConflictDetail
+
+
+# ---------- 区域传送收敛预演 ----------
+
+
+class TransferEdge(BaseModel):
+    """有向传送边 ``from -> to``：from 为上游，to 为从其同步 serial 的下游。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(
+        alias="from",
+        min_length=1,
+        max_length=253,
+        examples=["ns1.example.com"],
+        description="上游节点名（须在 nodes 中声明）",
+    )
+    to: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["ns2.example.com"],
+        description="下游节点名（须在 nodes 中声明；与 from 相同表示自环，按普通边处理）",
+    )
+
+    @field_validator("from_", "to")
+    @classmethod
+    def _check_endpoint(cls, value: str) -> str:
+        endpoint = value.strip()
+        if not endpoint:
+            raise ValueError("边端点节点名不能为空")
+        return endpoint
+
+
+class TransferSimulationCreate(BaseModel):
+    """区域传送收敛预演请求（仅预演，不写库）。"""
+
+    nodes: list[ReleasePlanNode] = Field(
+        min_length=1,
+        max_length=256,
+        description="参与传送的节点及其当前 serial（节点名去首尾空白后须在请求内唯一）",
+    )
+    edges: list[TransferEdge] = Field(
+        default_factory=list,
+        max_length=4096,
+        description="有向传送边列表（from 为上游、to 为下游；重复边视为一条）",
+    )
+    source: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["ns1.example.com"],
+        description="第 0 轮切换到发布值的源节点名（须在 nodes 中声明）",
+    )
+    publish_serial: Serial = Field(
+        description="源节点本次发布的 serial（相对源节点当前 serial 必须是 RFC 1982 有效前进）"
+    )
+    max_rounds: int = Field(
+        default=64,
+        ge=1,
+        le=1000,
+        description="第 0 轮（源节点切换）之后允许执行的最大同步轮数；达到上限仍可更新返回 409",
+    )
+
+    @field_validator("source")
+    @classmethod
+    def _check_source(cls, value: str) -> str:
+        source = value.strip()
+        if not source:
+            raise ValueError("源节点名不能为空")
+        return source
+
+    @model_validator(mode="after")
+    def _check_references_and_publish(self) -> "TransferSimulationCreate":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for node in self.nodes:
+            if node.name in seen and node.name not in duplicates:
+                duplicates.append(node.name)
+            seen.add(node.name)
+        if duplicates:
+            raise ValueError(f"节点名须唯一，重复节点名: {', '.join(duplicates)}")
+
+        if self.source not in seen:
+            raise ValueError(f"源节点 {self.source!r} 未在 nodes 中声明")
+
+        unknown: list[str] = []
+        for edge in self.edges:
+            for endpoint in (edge.from_, edge.to):
+                if endpoint not in seen and endpoint not in unknown:
+                    unknown.append(endpoint)
+        if unknown:
+            raise ValueError(f"传送边引用了未声明的节点: {', '.join(unknown)}")
+
+        source_serial = next(node.serial for node in self.nodes if node.name == self.source)
+        relation = classify(source_serial, self.publish_serial)
+        if relation != "advance":
+            raise ValueError(
+                f"发布 serial {self.publish_serial} 相对源节点 {self.source} 当前值 "
+                f"{source_serial} 不是 RFC 1982 有效前进（判定为 {relation}）"
+            )
+        return self
+
+
+class TransferNodeChange(BaseModel):
+    """单个节点在某一轮的 serial 变更。"""
+
+    node: str = Field(description="发生变更的节点名")
+    previous_serial: int = Field(description="本轮开始时（上一轮快照）该节点持有的 serial")
+    serial: int = Field(description="本轮结束后该节点采用的 serial")
+    upstream: str | None = Field(
+        description="该值来自的上游节点名；第 0 轮源节点切换为 null"
+    )
+    forward_distance: int = Field(
+        ge=1,
+        le=2**31 - 1,
+        description="从 previous_serial 到 serial 的模 2^32 前向距离（被选中的更新必为有效前进）",
+    )
+
+
+class TransferRound(BaseModel):
+    """一个同步轮次内的全部变更（第 0 轮恒为源节点单点切换）。"""
+
+    round: int = Field(ge=0, description="轮次编号，0 为源节点切换轮，1 起为同步轮")
+    changes: list[TransferNodeChange] = Field(
+        description="本轮内同时生效的变更（同步轮按节点名字典序排列）"
+    )
+
+
+class TransferSnapshotNode(BaseModel):
+    """快照中的单个节点及其 serial。"""
+
+    name: str
+    serial: int
+
+
+class TransferSimulationResultBase(BaseModel):
+    """收敛预演结果（200 与 409 共用的字段）。"""
+
+    zone: str
+    source: str = Field(description="第 0 轮切换到发布值的源节点名")
+    publish_serial: int = Field(description="源节点本次发布的 serial")
+    max_rounds: int = Field(description="第 0 轮之后允许执行的最大同步轮数")
+    sync_rounds_run: int = Field(
+        ge=0, description="实际执行的同步轮数（不含第 0 轮与无更新的终止探测轮）"
+    )
+    converged: bool = Field(description="是否在轮次上限内达到稳定（无节点可更新）")
+    rounds: list[TransferRound] = Field(
+        description="逐轮变更记录（含第 0 轮；每个记录的轮次均至少有一处变更）"
+    )
+    snapshot: list[TransferSnapshotNode] = Field(
+        description="最终（409 时为达到上限时）各节点 serial 快照，按请求节点顺序"
+    )
+    unconverged: list[TransferSnapshotNode] = Field(
+        description="快照中 serial 尚未等于发布值的节点（按请求节点顺序）"
+    )
+
+
+class TransferSimulationOut(TransferSimulationResultBase):
+    """正常收敛（200）响应体。"""
+
+    note: str
+
+
+class TransferSimulationConflictDetail(TransferSimulationResultBase):
+    """达到同步轮次上限仍可更新时 409 响应的 detail 结构。"""
+
+    reason: Literal["max_rounds_exceeded"]
+    message: str
+    updatable_nodes: list[str] = Field(
+        description="达到上限后依据当前快照仍可在下一轮更新的节点名（按请求节点顺序）"
+    )
+
+
+class TransferSimulationConflictResponse(BaseModel):
+    """达到同步轮次上限时 409 响应体（HTTPException 的标准 detail 包装）。"""
+
+    detail: TransferSimulationConflictDetail
